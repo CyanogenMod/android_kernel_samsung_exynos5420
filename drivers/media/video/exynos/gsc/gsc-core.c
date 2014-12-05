@@ -10,6 +10,7 @@
  * by the Free Software Foundation, either version 2 of the License,
  * or (at your option) any later version.
  */
+
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/version.h>
@@ -17,7 +18,6 @@
 #include <linux/errno.h>
 #include <linux/bug.h>
 #include <linux/interrupt.h>
-#include <linux/workqueue.h>
 #include <linux/device.h>
 #include <linux/platform_device.h>
 #include <linux/list.h>
@@ -26,14 +26,25 @@
 #include <linux/clk.h>
 #include <media/v4l2-ioctl.h>
 #include <plat/sysmmu.h>
+#include <plat/iovmm.h>
+
 #include "gsc-core.h"
-#define GSC_CLOCK_GATE_NAME		"gscl"
+#if defined(CONFIG_SOC_EXYNOS5410)
+static char *gsc_clocks[GSC_MAX_CLOCKS] = {
+	"gscl", "aclk_300_gscl", "dout_aclk_300_gscl"
+};
+#else
+static char *gsc_clocks[GSC_MAX_CLOCKS] = {
+	"gscl", "aclk_300_gscl", "aclk_300_gscl_sw"
+};
+#endif
 int gsc_dbg = 6;
 module_param(gsc_dbg, int, 0644);
+
 static struct gsc_fmt gsc_formats[] = {
 	{
 		.name		= "RGB565",
-		.pixelformat	= V4L2_PIX_FMT_RGB565X,
+		.pixelformat	= V4L2_PIX_FMT_RGB565,
 		.depth		= { 16 },
 		.num_planes	= 1,
 		.nr_comp	= 1,
@@ -136,6 +147,7 @@ static struct gsc_fmt gsc_formats[] = {
 		.corder		= GSC_CRCB,
 		.num_planes	= 1,
 		.nr_comp	= 3,
+
 	}, {
 		.name		= "YUV 4:2:0 planar, Y/CbCr",
 		.pixelformat	= V4L2_PIX_FMT_NV12,
@@ -194,27 +206,31 @@ static struct gsc_fmt gsc_formats[] = {
 		.nr_comp	= 2,
 	},
 };
+
 struct gsc_fmt *get_format(int index)
 {
 	return &gsc_formats[index];
 }
+
 struct gsc_fmt *find_format(u32 *pixelformat, u32 *mbus_code, int index)
 {
 	struct gsc_fmt *fmt, *def_fmt = NULL;
 	unsigned int i;
+
 	if (index >= ARRAY_SIZE(gsc_formats))
 		return NULL;
+
 	for (i = 0; i < ARRAY_SIZE(gsc_formats); ++i) {
 		fmt = get_format(i);
 		if (pixelformat && fmt->pixelformat == *pixelformat)
 			return fmt;
 		if (mbus_code && fmt->mbus_code == *mbus_code)
 			return fmt;
-		if (index == i)
-			def_fmt = fmt;
 	}
 	return def_fmt;
+
 }
+
 void gsc_set_frame_size(struct gsc_frame *frame, int width, int height)
 {
 	frame->f_width	= width;
@@ -224,19 +240,24 @@ void gsc_set_frame_size(struct gsc_frame *frame, int width, int height)
 	frame->crop.left = 0;
 	frame->crop.top = 0;
 }
+
 int gsc_cal_prescaler_ratio(struct gsc_variant *var, u32 src, u32 dst, u32 *ratio)
 {
 	if ((dst > src) || (dst >= src / var->poly_sc_down_max)) {
 		*ratio = 1;
 		return 0;
 	}
+
 	if ((src / var->poly_sc_down_max / var->pre_sc_down_max) > dst) {
 		gsc_err("scale ratio exceeded maximun scale down ratio(1/16)");
 		return -EINVAL;
 	}
+
 	*ratio = (dst > (src / 8)) ? 2 : 4;
+
 	return 0;
 }
+
 void gsc_get_prescaler_shfactor(u32 hratio, u32 vratio, u32 *sh)
 {
 	if (hratio == 4 && vratio == 4)
@@ -253,13 +274,16 @@ void gsc_get_prescaler_shfactor(u32 hratio, u32 vratio, u32 *sh)
 	else
 		*sh = 1;
 }
+
 void gsc_check_src_scale_info(struct gsc_variant *var, struct gsc_frame *s_frame,
 			      u32 *wratio, u32 tx, u32 ty, u32 *hratio, int rot)
 {
 	int remainder = 0, walign, halign;
 	int poly_sc_walign, poly_sc_halign;
+
 	poly_sc_walign = var->pix_align->real_w;
 	poly_sc_halign = var->pix_align->real_h;
+
 	if (is_yuv420(s_frame->fmt->pixelformat)) {
 		walign = *wratio << poly_sc_walign;
 		halign = *hratio << poly_sc_halign;
@@ -278,39 +302,48 @@ void gsc_check_src_scale_info(struct gsc_variant *var, struct gsc_frame *s_frame
 			halign = *hratio << (poly_sc_halign - 1);
 		}
 	}
+
 	remainder = s_frame->crop.width % walign;
 	if (remainder) {
 		s_frame->crop.width -= remainder;
 		gsc_cal_prescaler_ratio(var, s_frame->crop.width, tx, wratio);
-		gsc_dbg("cropped src width size is recalculated from %d to %d",
+		gsc_info("cropped src width size is recalculated from %d to %d",
 			s_frame->crop.width + remainder, s_frame->crop.width);
 	}
+
 	remainder = s_frame->crop.height % halign;
 	if (remainder) {
 		s_frame->crop.height -= remainder;
 		gsc_cal_prescaler_ratio(var, s_frame->crop.height, ty, hratio);
-		gsc_dbg("cropped src height size is recalculated from %d to %d",
+		gsc_info("cropped src height size is recalculated from %d to %d",
 			s_frame->crop.height + remainder, s_frame->crop.height);
 	}
 }
+
 int gsc_enum_fmt_mplane(struct v4l2_fmtdesc *f)
 {
 	struct gsc_fmt *fmt;
+
 	fmt = find_format(NULL, NULL, f->index);
 	if (!fmt)
 		return -EINVAL;
+
 	strncpy(f->description, fmt->name, sizeof(f->description) - 1);
 	f->pixelformat = fmt->pixelformat;
+
 	return 0;
 }
+
 u32 get_plane_size(struct gsc_frame *frame, unsigned int plane)
 {
 	if (!frame || plane >= frame->fmt->num_planes) {
 		gsc_err("Invalid argument");
 		return 0;
 	}
+
 	return frame->payload[plane];
 }
+
 u32 get_plane_info(struct gsc_frame frm, u32 addr, u32 *index)
 {
 	if (frm.addr.y == addr) {
@@ -327,10 +360,12 @@ u32 get_plane_info(struct gsc_frame frm, u32 addr, u32 *index)
 		return -EINVAL;
 	}
 }
+
 void gsc_set_prefbuf(struct gsc_dev *gsc, struct gsc_frame frm)
 {
 	u32 f_chk_addr, f_chk_len, s_chk_addr, s_chk_len;
 	f_chk_addr = f_chk_len = s_chk_addr = s_chk_len = 0;
+
 	f_chk_addr = frm.addr.y;
 	f_chk_len = frm.payload[0];
 	if (frm.fmt->num_planes == 2) {
@@ -339,10 +374,12 @@ void gsc_set_prefbuf(struct gsc_dev *gsc, struct gsc_frame frm)
 	} else if (frm.fmt->num_planes == 3) {
 		u32 low_addr, low_plane, mid_addr, mid_plane, high_addr, high_plane;
 		u32 t_min, t_max;
+
 		t_min = min3(frm.addr.y, frm.addr.cb, frm.addr.cr);
 		low_addr = get_plane_info(frm, t_min, &low_plane);
 		t_max = max3(frm.addr.y, frm.addr.cb, frm.addr.cr);
 		high_addr = get_plane_info(frm, t_max, &high_plane);
+
 		mid_plane = 3 - (low_plane + high_plane);
 		if (mid_plane == 0)
 			mid_addr = frm.addr.y;
@@ -352,6 +389,7 @@ void gsc_set_prefbuf(struct gsc_dev *gsc, struct gsc_frame frm)
 			mid_addr = frm.addr.cr;
 		else
 			return;
+
 		f_chk_addr = low_addr;
 		if (mid_addr + frm.payload[mid_plane] - low_addr >
 		    high_addr + frm.payload[high_plane] - mid_addr) {
@@ -369,6 +407,7 @@ void gsc_set_prefbuf(struct gsc_dev *gsc, struct gsc_frame frm)
 	gsc_dbg("f_addr = 0x%08x, f_len = %d, s_addr = 0x%08x, s_len = %d\n",
 		f_chk_addr, f_chk_len, s_chk_addr, s_chk_len);
 }
+
 int gsc_try_fmt_mplane(struct gsc_ctx *ctx, struct v4l2_format *f)
 {
 	struct gsc_dev *gsc = ctx->gsc_dev;
@@ -378,18 +417,22 @@ int gsc_try_fmt_mplane(struct gsc_ctx *ctx, struct v4l2_format *f)
 	u32 max_w, max_h, mod_x, mod_y;
 	u32 min_w, min_h, tmp_w, tmp_h;
 	int i;
+
 	gsc_dbg("user put w: %d, h: %d", pix_mp->width, pix_mp->height);
+
 	fmt = find_format(&pix_mp->pixelformat, NULL, 0);
 	if (!fmt) {
 		gsc_err("pixelformat format (0x%X) invalid\n", pix_mp->pixelformat);
 		return -EINVAL;
 	}
+
 	if (pix_mp->field == V4L2_FIELD_ANY)
 		pix_mp->field = V4L2_FIELD_NONE;
 	else if (pix_mp->field != V4L2_FIELD_NONE) {
 		gsc_err("Not supported field order(%d)\n", pix_mp->field);
 		return -EINVAL;
 	}
+
 	max_w = variant->pix_max->target_rot_dis_w;
 	max_h = variant->pix_max->target_rot_dis_h;
 	if (V4L2_TYPE_IS_OUTPUT(f->type)) {
@@ -401,11 +444,13 @@ int gsc_try_fmt_mplane(struct gsc_ctx *ctx, struct v4l2_format *f)
 		min_w = variant->pix_min->org_w;
 		min_h = variant->pix_min->org_h;
 	} else {
-		mod_x = ffs(variant->pix_align->org_w) - 1;
-		if (is_yuv420(fmt->pixelformat))
-			mod_y = ffs(variant->pix_align->org_h) - 1;
-		else
-			mod_y = ffs(variant->pix_align->org_h) - 2;
+		if (is_yuv420(fmt->pixelformat)) {
+			mod_x = ffs(variant->pix_align->org_w) - 1;
+			mod_y = 1;
+		} else {
+			mod_x = ffs(variant->pix_align->org_w) - 2;
+			mod_y = 0;
+		}
 		min_w = variant->pix_min->target_rot_dis_w;
 		min_h = variant->pix_min->target_rot_dis_h;
 	}
@@ -415,152 +460,184 @@ int gsc_try_fmt_mplane(struct gsc_ctx *ctx, struct v4l2_format *f)
 	   hardware abilities */
 	tmp_w = pix_mp->width;
 	tmp_h = pix_mp->height;
+
 	v4l_bound_align_image(&pix_mp->width, min_w, max_w, mod_x,
 		&pix_mp->height, min_h, max_h, mod_y, 0);
 	if (tmp_w != pix_mp->width || tmp_h != pix_mp->height)
-		gsc_dbg("Image size has been modified from %dx%d to %dx%d",
+		gsc_info("Image size has been modified from %dx%d to %dx%d",
 			 tmp_w, tmp_h, pix_mp->width, pix_mp->height);
+
 	pix_mp->num_planes = fmt->num_planes;
+
 	if (ctx->gsc_ctrls.csc_eq_mode->val)
 		ctx->gsc_ctrls.csc_eq->val =
-			(pix_mp->width >= 1280) ? 1 : 0;
-	if (ctx->gsc_ctrls.csc_eq->val) /* HD */
+		(pix_mp->width >= 1280) ?
+		V4L2_COLORSPACE_REC709 : V4L2_COLORSPACE_SMPTE170M;
+
+	if (is_csc_eq_709) /* HD */
 		pix_mp->colorspace = V4L2_COLORSPACE_REC709;
 	else	/* SD */
 		pix_mp->colorspace = V4L2_COLORSPACE_SMPTE170M;
+
 	for (i = 0; i < pix_mp->num_planes; ++i) {
 		int bpl = (pix_mp->width * fmt->depth[i]) >> 3;
 		pix_mp->plane_fmt[i].bytesperline = bpl;
-		pix_mp->plane_fmt[i].sizeimage = bpl * pix_mp->height;
+		if (is_AYV12(fmt->pixelformat))
+			pix_mp->plane_fmt[i].sizeimage =
+			(pix_mp->width * pix_mp->height) +
+			((ALIGN(pix_mp->width >> 1, 16) *
+			  (pix_mp->height >> 1) * 2));
+		else
+			pix_mp->plane_fmt[i].sizeimage = bpl * pix_mp->height;
+
 		gsc_dbg("[%d]: bpl: %d, sizeimage: %d",
 		    i, bpl, pix_mp->plane_fmt[i].sizeimage);
 	}
+
 	return 0;
 }
+
 int gsc_g_fmt_mplane(struct gsc_ctx *ctx, struct v4l2_format *f)
 {
 	struct gsc_frame *frame;
 	struct v4l2_pix_format_mplane *pix_mp;
 	int i;
+
 	frame = ctx_get_frame(ctx, f->type);
 	if (IS_ERR(frame))
 		return PTR_ERR(frame);
+
 	pix_mp = &f->fmt.pix_mp;
+
 	pix_mp->width		= frame->f_width;
 	pix_mp->height		= frame->f_height;
 	pix_mp->field		= V4L2_FIELD_NONE;
 	pix_mp->pixelformat	= frame->fmt->pixelformat;
 	pix_mp->colorspace	= V4L2_COLORSPACE_JPEG;
 	pix_mp->num_planes	= frame->fmt->num_planes;
+
 	for (i = 0; i < pix_mp->num_planes; ++i) {
 		pix_mp->plane_fmt[i].bytesperline = (frame->f_width *
 			frame->fmt->depth[i]) / 8;
 		pix_mp->plane_fmt[i].sizeimage = pix_mp->plane_fmt[i].bytesperline *
 			frame->f_height;
 	}
+
 	return 0;
 }
+
 void gsc_check_crop_change(u32 tmp_w, u32 tmp_h, u32 *w, u32 *h)
 {
 	if (tmp_w != *w || tmp_h != *h) {
-		gsc_dbg("Image cropped size has been modified from %dx%d to %dx%d",
+		gsc_info("Image cropped size has been modified from %dx%d to %dx%d",
 				*w, *h, tmp_w, tmp_h);
 		*w = tmp_w;
 		*h = tmp_h;
 	}
 }
+
 int gsc_g_crop(struct gsc_ctx *ctx, struct v4l2_crop *cr)
 {
 	struct gsc_frame *frame;
+
 	frame = ctx_get_frame(ctx, cr->type);
 	if (IS_ERR(frame))
 		return PTR_ERR(frame);
+
 	memcpy(&cr->c, &frame->crop, sizeof(struct v4l2_rect));
+
 	return 0;
 }
+
 int gsc_try_crop(struct gsc_ctx *ctx, struct v4l2_crop *cr)
 {
 	struct gsc_frame *f;
 	struct gsc_dev *gsc = ctx->gsc_dev;
-	struct gsc_variant *variant = gsc->variant;
+	struct gsc_variant *var = gsc->variant;
 	u32 mod_x = 0, mod_y = 0, tmp_w, tmp_h;
 	u32 min_w, min_h, max_w, max_h;
+
 	if (cr->c.top < 0 || cr->c.left < 0) {
 		gsc_err("doesn't support negative values for top & left\n");
 		return -EINVAL;
 	}
 	gsc_dbg("user put w: %d, h: %d", cr->c.width, cr->c.height);
+
 	if (cr->type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
 		f = &ctx->d_frame;
 	else if (cr->type == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
 		f = &ctx->s_frame;
 	else
 		return -EINVAL;
-	max_w = f->f_width;
-	max_h = f->f_height;
+
 	tmp_w = cr->c.width;
 	tmp_h = cr->c.height;
+
 	if (V4L2_TYPE_IS_OUTPUT(cr->type)) {
-		if ((is_yuv422(f->fmt->pixelformat) && f->fmt->nr_comp == 1) ||
-		    is_rgb(f->fmt->pixelformat))
-			min_w = 32;
-		else
-			min_w = 64;
-		if ((is_yuv422(f->fmt->pixelformat) && f->fmt->nr_comp == 3) ||
-		    is_yuv420(f->fmt->pixelformat))
-			min_h = 32;
-		else
-			min_h = 16;
-	} else {
-		if (is_yuv420(f->fmt->pixelformat) ||
-		    is_yuv422(f->fmt->pixelformat))
-			mod_x = ffs(variant->pix_align->target_w) - 1;
-		if (is_yuv420(f->fmt->pixelformat))
-			mod_y = ffs(variant->pix_align->target_h) - 1;
-		if (ctx->gsc_ctrls.rotate->val == 90 ||
-		    ctx->gsc_ctrls.rotate->val == 270) {
-			max_w = f->f_height;
-			max_h = f->f_width;
-			min_w = variant->pix_min->target_rot_en_w;
-			min_h = variant->pix_min->target_rot_en_h;
-			tmp_w = cr->c.height;
-			tmp_h = cr->c.width;
+		if (is_rotation) {
+			max_w = min(f->f_width, (u32)var->pix_max->real_rot_en_w);
+			max_h = min(f->f_height, (u32)var->pix_max->real_rot_en_h);
+			min_w = is_yuv420(f->fmt->pixelformat) ? 32 : 16;
+			min_h = is_rgb(f->fmt->pixelformat) ? 32 : 64;
 		} else {
-			min_w = variant->pix_min->target_rot_dis_w;
-			min_h = variant->pix_min->target_rot_dis_h;
+			max_w = min(f->f_width, (u32)var->pix_max->real_rot_dis_w);
+			max_h = min(f->f_height, (u32)var->pix_max->real_rot_dis_h);
+			min_w = is_rgb(f->fmt->pixelformat) ? 32 : 64;
+			min_h = is_yuv420(f->fmt->pixelformat) ? 32 : 16;
+		}
+	} else {
+		if (is_rotation) {
+			max_w = min(f->f_width, (u32)var->pix_max->target_rot_en_w);
+			max_h = min(f->f_height, (u32)var->pix_max->target_rot_en_h);
+			min_w = is_yuv420(f->fmt->pixelformat) ? 16 : 8;
+			min_h = is_rgb(f->fmt->pixelformat) ? 16 : 32;
+		} else {
+			max_w = min(f->f_width, (u32)var->pix_max->target_rot_dis_w);
+			max_h = min(f->f_height, (u32)var->pix_max->target_rot_dis_h);
+			min_w = is_rgb(f->fmt->pixelformat) ? 16 : 32;
+			min_h = is_yuv420(f->fmt->pixelformat) ? 16 : 8;
+		}
+		if (is_rgb(f->fmt->pixelformat)) {
+			mod_x = ffs(var->pix_align->target_w) - 2;
+			mod_y = ffs(var->pix_align->target_h) - 2;
+		} else {
+			mod_x = ffs(var->pix_align->target_w) - 1;
+			mod_y = ffs(var->pix_align->target_h) - 1;
 		}
 	}
 	gsc_dbg("mod_x: %d, mod_y: %d, min_w: %d, min_h = %d,\
 		tmp_w : %d, tmp_h : %d",
 		mod_x, mod_y, min_w, min_h, tmp_w, tmp_h);
+
 	v4l_bound_align_image(&tmp_w, min_w, max_w, mod_x,
 			      &tmp_h, min_h, max_h, mod_y, 0);
-	if (!V4L2_TYPE_IS_OUTPUT(cr->type) &&
-	    (ctx->gsc_ctrls.rotate->val == 90 ||
-	    ctx->gsc_ctrls.rotate->val == 270)) {
-		gsc_check_crop_change(tmp_h, tmp_w, &cr->c.width, &cr->c.height);
-	} else {
-		gsc_check_crop_change(tmp_w, tmp_h, &cr->c.width, &cr->c.height);
-	}
+
+	gsc_check_crop_change(tmp_w, tmp_h, &cr->c.width, &cr->c.height);
+
 	/* adjust left/top if cropping rectangle is out of bounds */
 	/* Need to add code to algin left value with 2's multiple */
 	if (cr->c.left + tmp_w > max_w)
 		cr->c.left = max_w - tmp_w;
 	if (cr->c.top + tmp_h > max_h)
 		cr->c.top = max_h - tmp_h;
+
 	if (is_yuv420(f->fmt->pixelformat) || is_yuv422(f->fmt->pixelformat))
 		if (cr->c.left % 2)
 			cr->c.left -= 1;
+
 	gsc_dbg("Aligned l:%d, t:%d, w:%d, h:%d, f_w: %d, f_h: %d",
 	    cr->c.left, cr->c.top, cr->c.width, cr->c.height, max_w, max_h);
+
 	return 0;
 }
+
 int gsc_check_scaler_ratio(struct gsc_variant *var, int sw, int sh, int dw,
 			   int dh, int rot, int out_path)
 {
 	int tmp_w, tmp_h, sc_down_max;
 	sc_down_max =
 		(out_path == GSC_DMA) ? var->sc_down_max : var->local_sc_down;
+
 	if (rot == 90 || rot == 270) {
 		tmp_w = dh;
 		tmp_h = dw;
@@ -568,13 +645,16 @@ int gsc_check_scaler_ratio(struct gsc_variant *var, int sw, int sh, int dw,
 		tmp_w = dw;
 		tmp_h = dh;
 	}
+
 	if ((sw > (tmp_w * sc_down_max)) ||
 	    (sh > (tmp_h * sc_down_max)) ||
 	    (tmp_w > (sw * var->sc_up_max)) ||
 	    (tmp_h > (sh * var->sc_up_max)))
 		return -EINVAL;
+
 	return 0;
 }
+
 int gsc_set_scaler_info(struct gsc_ctx *ctx)
 {
 	struct gsc_scaler *sc = &ctx->scaler;
@@ -583,7 +663,9 @@ int gsc_set_scaler_info(struct gsc_ctx *ctx)
 	struct gsc_variant *variant = ctx->gsc_dev->variant;
 	int tx, ty, rot;
 	int ret;
+
 	rot = ctx->gsc_ctrls.rotate->val;
+
 	ret = gsc_check_scaler_ratio(variant, s_frame->crop.width,
 		s_frame->crop.height, d_frame->crop.width, d_frame->crop.height,
 		ctx->gsc_ctrls.rotate->val, ctx->out_path);
@@ -591,6 +673,7 @@ int gsc_set_scaler_info(struct gsc_ctx *ctx)
 		gsc_err("out of scaler range");
 		return ret;
 	}
+
 	if (rot == 90 || rot == 270) {
 		ty = d_frame->crop.width;
 		tx = d_frame->crop.height;
@@ -598,48 +681,59 @@ int gsc_set_scaler_info(struct gsc_ctx *ctx)
 		tx = d_frame->crop.width;
 		ty = d_frame->crop.height;
 	}
+
 	ret = gsc_cal_prescaler_ratio(variant, s_frame->crop.width,
 				      tx, &sc->pre_hratio);
 	if (ret) {
 		gsc_err("Horizontal scale ratio is out of range");
 		return ret;
 	}
+
 	ret = gsc_cal_prescaler_ratio(variant, s_frame->crop.height,
 				      ty, &sc->pre_vratio);
 	if (ret) {
 		gsc_err("Vertical scale ratio is out of range");
 		return ret;
 	}
+
 	gsc_check_src_scale_info(variant, s_frame, &sc->pre_hratio,
 				 tx, ty, &sc->pre_vratio, rot);
+
 	gsc_get_prescaler_shfactor(sc->pre_hratio, sc->pre_vratio,
 				   &sc->pre_shfactor);
+
 	sc->main_hratio = (s_frame->crop.width << 16) / tx;
 	sc->main_vratio = (s_frame->crop.height << 16) / ty;
+
 	gsc_dbg("scaler input/output size : sx = %d, sy = %d, tx = %d, ty = %d",
 		s_frame->crop.width, s_frame->crop.height, tx, ty);
 	gsc_dbg("scaler ratio info : pre_shfactor : %d, pre_h : %d, pre_v :%d,\
 		main_h : %ld, main_v : %ld", sc->pre_shfactor, sc->pre_hratio,
 		sc->pre_vratio, sc->main_hratio, sc->main_vratio);
+
 	return 0;
 }
+
 int gsc_pipeline_s_stream(struct gsc_dev *gsc, bool on)
 {
 	struct gsc_pipeline *p = &gsc->pipeline;
 	struct exynos_entity_data md_data;
 	int ret = 0;
+
 	/* If gscaler subdev calls the mixer's s_stream, the gscaler must
 	   inform the mixer subdev pipeline started from gscaler */
-	if (!strncmp(p->disp->name, MXR_SUBDEV_NAME,
-				sizeof(MXR_SUBDEV_NAME) - 1)) {
+	if (gsc->out.ctx->out_path == GSC_MIXER) {
 		md_data.mxr_data_from = FROM_GSC_SD;
 		v4l2_set_subdevdata(p->disp, &md_data);
 	}
+
 	ret = v4l2_subdev_call(p->disp, video, s_stream, on);
 	if (ret)
 		gsc_err("Display s_stream on failed\n");
+
 	return ret;
 }
+
 int gsc_out_link_validate(const struct media_pad *source,
 			  const struct media_pad *sink)
 {
@@ -649,17 +743,21 @@ int gsc_out_link_validate(const struct media_pad *source,
 	struct gsc_dev *gsc;
 	struct gsc_frame *f;
 	int ret;
+
 	if (media_entity_type(source->entity) != MEDIA_ENT_T_V4L2_SUBDEV ||
 	    media_entity_type(sink->entity) != MEDIA_ENT_T_V4L2_SUBDEV) {
 		gsc_err("media entity type isn't subdev\n");
 		return 0;
 	}
+
 	sd = media_entity_to_v4l2_subdev(source->entity);
 	gsc = entity_data_to_gsc(v4l2_get_subdevdata(sd));
 	f = &gsc->out.ctx->d_frame;
+
 	src_fmt.format.width = f->crop.width;
 	src_fmt.format.height = f->crop.height;
 	src_fmt.format.code = f->fmt->mbus_code;
+
 	sd = media_entity_to_v4l2_subdev(sink->entity);
 	/* To check if G-Scaler destination size and Mixer destinatin size
 	   are the same */
@@ -670,6 +768,7 @@ int gsc_out_link_validate(const struct media_pad *source,
 		gsc_err("subdev get_fmt is failed\n");
 		return -EPIPE;
 	}
+
 	if (src_fmt.format.width != dst_crop.rect.width ||
 	    src_fmt.format.height != dst_crop.rect.height) {
 		gsc_err("sink and source format is different\
@@ -680,8 +779,10 @@ int gsc_out_link_validate(const struct media_pad *source,
 			gsc->out.ctx->gsc_ctrls.rotate->val);
 		return -EINVAL;
 	}
+
 	return 0;
 }
+
 /*
  * Set alpha blending for all layers of mixer when gscaler is connected
  * to mixer only
@@ -692,11 +793,13 @@ static int gsc_s_ctrl_to_mxr(struct v4l2_ctrl *ctrl)
 	struct media_pad *pad = &ctx->gsc_dev->out.sd_pads[GSC_PAD_SOURCE];
 	struct v4l2_subdev *sd, *gsc_sd;
 	struct v4l2_control control;
+
 	pad = media_entity_remote_source(pad);
 	if (IS_ERR(pad)) {
 		gsc_err("No sink pad conncted with a gscaler source pad");
 		return PTR_ERR(pad);
 	}
+
 	sd = media_entity_to_v4l2_subdev(pad->entity);
 	gsc_sd = ctx->gsc_dev->out.sd;
 	gsc_dbg("%s is connected to %s\n", gsc_sd->name, sd->name);
@@ -704,6 +807,7 @@ static int gsc_s_ctrl_to_mxr(struct v4l2_ctrl *ctrl)
 		gsc_err("%s is not connected to mixer\n", gsc_sd->name);
 		return -ENODEV;
 	}
+
 	switch (ctrl->id) {
 	case V4L2_CID_TV_LAYER_BLEND_ENABLE:
 	case V4L2_CID_TV_LAYER_BLEND_ALPHA:
@@ -715,43 +819,73 @@ static int gsc_s_ctrl_to_mxr(struct v4l2_ctrl *ctrl)
 		control.value = ctrl->val;
 		v4l2_subdev_call(sd, core, s_ctrl, &control);
 		break;
+
 	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/*
+ * V4L2 controls handling
+ */
+
+static int gsc_g_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct gsc_ctx *ctx = ctrl_to_ctx(ctrl);
+	struct gsc_dev *gsc = ctx->gsc_dev;
+
+	switch (ctrl->id) {
+	case V4L2_CID_M2M_CTX_NUM:
+		update_ctrl_value(ctx->gsc_ctrls.m2m_ctx_num, gsc->m2m.refcnt);
+		break;
+
+	default:
+		gsc_err("Invalid control\n");
 		return -EINVAL;
 	}
 	return 0;
 }
-/*
- * V4L2 controls handling
- */
+
 static int gsc_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct gsc_ctx *ctx = ctrl_to_ctx(ctrl);
 	int ret;
+
 	switch (ctrl->id) {
 	case V4L2_CID_HFLIP:
 		update_ctrl_value(ctx->gsc_ctrls.hflip, ctrl->val);
 		break;
+
 	case V4L2_CID_VFLIP:
 		update_ctrl_value(ctx->gsc_ctrls.vflip, ctrl->val);
 		break;
+
 	case V4L2_CID_ROTATE:
 		update_ctrl_value(ctx->gsc_ctrls.rotate, ctrl->val);
 		break;
+
 	case V4L2_CID_GLOBAL_ALPHA:
 		update_ctrl_value(ctx->gsc_ctrls.global_alpha, ctrl->val);
 		break;
+
 	case V4L2_CID_CACHEABLE:
 		update_ctrl_value(ctx->gsc_ctrls.cacheable, ctrl->val);
 		break;
+
 	case V4L2_CID_CSC_EQ_MODE:
 		update_ctrl_value(ctx->gsc_ctrls.csc_eq_mode, ctrl->val);
 		break;
+
 	case V4L2_CID_CSC_EQ:
 		update_ctrl_value(ctx->gsc_ctrls.csc_eq, ctrl->val);
 		break;
+
 	case V4L2_CID_CSC_RANGE:
 		update_ctrl_value(ctx->gsc_ctrls.csc_range, ctrl->val);
 		break;
+
 	case V4L2_CID_CONTENT_PROTECTION:
 		update_ctrl_value(ctx->gsc_ctrls.drm_en, ctrl->val);
 		break;
@@ -762,13 +896,18 @@ static int gsc_s_ctrl(struct v4l2_ctrl *ctrl)
 			return ret;
 		}
 	}
+
 	if (gsc_m2m_opened(ctx->gsc_dev))
 		gsc_ctx_state_lock_set(GSC_PARAMS, ctx);
+
 	return 0;
 }
+
 const struct v4l2_ctrl_ops gsc_ctrl_ops = {
+	.g_volatile_ctrl = gsc_g_ctrl,
 	.s_ctrl = gsc_s_ctrl,
 };
+
 static const struct v4l2_ctrl_config gsc_custom_ctrl[] = {
 	{
 		.ops = &gsc_ctrl_ops,
@@ -847,8 +986,8 @@ static const struct v4l2_ctrl_config gsc_custom_ctrl[] = {
 		.name = "Set CSC equation",
 		.type = V4L2_CTRL_TYPE_INTEGER,
 		.flags = V4L2_CTRL_FLAG_SLIDER,
-		.max = 8,
 		.step = 1,
+		.max = V4L2_COLORSPACE_SRGB,
 		.def = V4L2_COLORSPACE_REC709,
 	}, {
 		.ops = &gsc_ctrl_ops,
@@ -866,21 +1005,35 @@ static const struct v4l2_ctrl_config gsc_custom_ctrl[] = {
 		.flags = V4L2_CTRL_FLAG_SLIDER,
 		.max = 1,
 		.def = DEFAULT_CONTENT_PROTECTION,
+	}, {
+		.ops = &gsc_ctrl_ops,
+		.id = V4L2_CID_M2M_CTX_NUM,
+		.name = "Get number of m2m context",
+		.type = V4L2_CTRL_TYPE_INTEGER,
+		.flags = V4L2_CTRL_FLAG_SLIDER,
+		.step = 1,
+		.min = 0,
+		.max = 255,
+		.def = 0,
 	},
 };
+
 int gsc_ctrls_create(struct gsc_ctx *ctx)
 {
 	if (ctx->ctrls_rdy) {
 		gsc_err("Control handler of this context was created already");
 		return 0;
 	}
+
 	v4l2_ctrl_handler_init(&ctx->ctrl_handler, GSC_MAX_CTRL_NUM);
+
 	ctx->gsc_ctrls.rotate = v4l2_ctrl_new_std(&ctx->ctrl_handler,
 				&gsc_ctrl_ops, V4L2_CID_ROTATE, 0, 270, 90, 0);
 	ctx->gsc_ctrls.hflip = v4l2_ctrl_new_std(&ctx->ctrl_handler,
 				&gsc_ctrl_ops, V4L2_CID_HFLIP, 0, 1, 1, 0);
 	ctx->gsc_ctrls.vflip = v4l2_ctrl_new_std(&ctx->ctrl_handler,
 				&gsc_ctrl_ops, V4L2_CID_VFLIP, 0, 1, 1, 0);
+
 	ctx->gsc_ctrls.global_alpha = v4l2_ctrl_new_custom(&ctx->ctrl_handler,
 					&gsc_custom_ctrl[0], NULL);
 	ctx->gsc_ctrls.cacheable = v4l2_ctrl_new_custom(&ctx->ctrl_handler,
@@ -898,6 +1051,7 @@ int gsc_ctrls_create(struct gsc_ctx *ctx)
 					&gsc_custom_ctrl[6], NULL);
 	ctx->gsc_ctrls.prio = v4l2_ctrl_new_custom(&ctx->ctrl_handler,
 					&gsc_custom_ctrl[7], NULL);
+
 	/* for CSC equation */
 	ctx->gsc_ctrls.csc_eq_mode = v4l2_ctrl_new_custom(&ctx->ctrl_handler,
 					&gsc_custom_ctrl[8], NULL);
@@ -905,17 +1059,28 @@ int gsc_ctrls_create(struct gsc_ctx *ctx)
 					&gsc_custom_ctrl[9], NULL);
 	ctx->gsc_ctrls.csc_range = v4l2_ctrl_new_custom(&ctx->ctrl_handler,
 					&gsc_custom_ctrl[10], NULL);
+
 	ctx->gsc_ctrls.drm_en = v4l2_ctrl_new_custom(&ctx->ctrl_handler,
 					&gsc_custom_ctrl[11], NULL);
+
+	/* for gscaler m2m context information */
+	ctx->gsc_ctrls.m2m_ctx_num = v4l2_ctrl_new_custom(&ctx->ctrl_handler,
+					&gsc_custom_ctrl[12], NULL);
+	if (ctx->gsc_ctrls.m2m_ctx_num)
+		ctx->gsc_ctrls.m2m_ctx_num->flags |= V4L2_CTRL_FLAG_VOLATILE;
+
 	ctx->ctrls_rdy = ctx->ctrl_handler.error == 0;
+
 	if (ctx->ctrl_handler.error) {
 		int err = ctx->ctrl_handler.error;
 		v4l2_ctrl_handler_free(&ctx->ctrl_handler);
 		gsc_err("Failed to gscaler control hander create");
 		return err;
 	}
+
 	return 0;
 }
+
 void gsc_ctrls_delete(struct gsc_ctx *ctx)
 {
 	if (ctx->ctrls_rdy) {
@@ -923,6 +1088,7 @@ void gsc_ctrls_delete(struct gsc_ctx *ctx)
 		ctx->ctrls_rdy = false;
 	}
 }
+
 /* The color format (nr_comp, num_planes) must be already configured. */
 int gsc_prepare_addr(struct gsc_ctx *ctx, struct vb2_buffer *vb,
 		     struct gsc_frame *frame, struct gsc_addr *addr)
@@ -930,14 +1096,22 @@ int gsc_prepare_addr(struct gsc_ctx *ctx, struct vb2_buffer *vb,
 	struct gsc_dev *gsc = ctx->gsc_dev;
 	int ret = 0;
 	u32 pix_size;
+	u32 y_size = 0;
+	u32 cb_size = 0;
+	u32 cr_size = 0;;
+
 	if (IS_ERR(vb) || IS_ERR(frame)) {
 		gsc_err("Invalid argument");
 		return -EINVAL;
 	}
+
 	pix_size = frame->f_width * frame->f_height;
+
 	gsc_dbg("num_planes= %d, nr_comp= %d, pix_size= %d",
 		frame->fmt->num_planes, frame->fmt->nr_comp, pix_size);
+
 	addr->y = gsc->vb2->plane_addr(vb, 0);
+
 	if (frame->fmt->num_planes == 1) {
 		switch (frame->fmt->nr_comp) {
 		case 1:
@@ -950,8 +1124,14 @@ int gsc_prepare_addr(struct gsc_ctx *ctx, struct vb2_buffer *vb,
 			addr->cr = 0;
 			break;
 		case 3:
-			addr->cb = (dma_addr_t)(addr->y + pix_size);
-			addr->cr = (dma_addr_t)(addr->cb + (pix_size >> 2));
+			if (is_AYV12(frame->fmt->pixelformat)) {
+				addr->cb = (dma_addr_t)(addr->y + pix_size);
+				addr->cr = (dma_addr_t)(addr->cb + (ALIGN(frame->f_width >> 1, 16)) *
+						(frame->f_height >> 1));
+			} else {
+				addr->cb = (dma_addr_t)(addr->y + pix_size);
+				addr->cr = (dma_addr_t)(addr->cb + (pix_size >> 2));
+			}
 			break;
 		default:
 			gsc_err("Invalid the number of color planes");
@@ -963,59 +1143,113 @@ int gsc_prepare_addr(struct gsc_ctx *ctx, struct vb2_buffer *vb,
 		if (frame->fmt->num_planes == 3)
 			addr->cr = gsc->vb2->plane_addr(vb, 2);
 	}
+
 	if (frame->fmt->pixelformat == V4L2_PIX_FMT_YVU420 ||
 	    frame->fmt->pixelformat == V4L2_PIX_FMT_YVU420M) {
 		u32 t_cb = addr->cb;
 		addr->cb = addr->cr;
 		addr->cr = t_cb;
 	}
+
+	if (!gsc->protected_content && is_output(vb->vb2_queue->type)) {
+		if (is_rgb(frame->fmt->pixelformat)) {
+			if (is_rgb32(frame->fmt->pixelformat))
+				y_size = pix_size << 2;
+			else
+				y_size = pix_size << 1;
+		} else if (is_yuv422(frame->fmt->pixelformat)) {
+			if (frame->fmt->nr_comp == 1)
+				y_size = pix_size << 1;
+			else if (frame->fmt->nr_comp == 2)
+				y_size = cb_size = pix_size;
+		} else if (is_yuv420(frame->fmt->pixelformat)) {
+			if (frame->fmt->nr_comp == 2) {
+				y_size = pix_size;
+				cb_size = pix_size >> 1;
+			} else if (frame->fmt->nr_comp == 3) {
+				y_size = pix_size;
+				if (is_AYV12(frame->fmt->pixelformat))
+					cb_size = cr_size =
+					ALIGN(frame->f_width >> 1, 16) *
+						(frame->f_height >> 1);
+				else
+					cb_size = cr_size = pix_size >> 2;
+			}
+		}
+
+		ctx->prebuf[0].base = addr->y;
+		ctx->prebuf[0].size = y_size;
+		ctx->prebuf[1].base = addr->cb;
+		ctx->prebuf[1].size = cb_size;
+		ctx->prebuf[2].base = addr->cr;
+		ctx->prebuf[2].size = cr_size;
+	}
 	gsc_dbg("ADDR: y= 0x%X  cb= 0x%X cr= 0x%X ret= %d",
 		addr->y, addr->cb, addr->cr, ret);
+
 	return ret;
 }
-void gsc_wq_suspend(struct work_struct *work)
-{
-	struct gsc_dev *gsc = container_of(work, struct gsc_dev,
-					     work_struct);
-	pm_runtime_put_sync(&gsc->pdev->dev);
-}
+
 void gsc_cap_irq_handler(struct gsc_dev *gsc)
 {
 	int done_index;
+
 	done_index = gsc_hw_get_done_output_buf_index(gsc);
 	gsc_dbg("done_index : %d", done_index);
-	if (done_index < 0)
+	if (done_index < 0) {
 		gsc_err("All buffers are masked\n");
+		return;
+	}
 	test_bit(ST_CAPT_RUN, &gsc->state) ? :
 		set_bit(ST_CAPT_RUN, &gsc->state);
 	vb2_buffer_done(gsc->cap.vbq.bufs[done_index], VB2_BUF_STATE_DONE);
 }
+
 static irqreturn_t gsc_irq_handler(int irq, void *priv)
 {
 	struct gsc_dev *gsc = priv;
 	int gsc_irq;
+
+#ifdef GSC_PERF
+	gsc->end_time = sched_clock();
+	gsc_dbg("OPERATION-TIME: %llu\n", gsc->end_time - gsc->start_time);
+#endif
 	gsc_irq = gsc_hw_get_irq_status(gsc);
 	gsc_hw_clear_irq(gsc, gsc_irq);
+
 	if (gsc_irq == GSC_OR_IRQ) {
-		gsc_err("Local path input over-run interrupt has occurred!\n");
+		gsc_err("Local path input over-run interrupt has occurred!");
 		return IRQ_HANDLED;
 	}
+
 	spin_lock(&gsc->slock);
+
 	if (test_and_clear_bit(ST_M2M_RUN, &gsc->state)) {
 		struct vb2_buffer *src_vb, *dst_vb;
 		struct gsc_ctx *ctx =
 			v4l2_m2m_get_curr_priv(gsc->m2m.m2m_dev);
-		if (!ctx || !ctx->m2m_ctx)
+
+		if (timer_pending(&gsc->op_timer))
+			del_timer(&gsc->op_timer);
+
+		if (!ctx || !ctx->m2m_ctx) {
+			gsc_err("ctx : 0x%p", ctx);
+			pm_runtime_put(&gsc->pdev->dev);
+			gsc->runtime_put_cnt++;
 			goto isr_unlock;
+		}
+
 		src_vb = v4l2_m2m_src_buf_remove(ctx->m2m_ctx);
 		dst_vb = v4l2_m2m_dst_buf_remove(ctx->m2m_ctx);
 		if (src_vb && dst_vb) {
 			v4l2_m2m_buf_done(src_vb, VB2_BUF_STATE_DONE);
 			v4l2_m2m_buf_done(dst_vb, VB2_BUF_STATE_DONE);
+
 			if (test_and_clear_bit(ST_STOP_REQ, &gsc->state))
 				wake_up(&gsc->irq_queue);
 			else
 				v4l2_m2m_job_finish(gsc->m2m.m2m_dev, ctx->m2m_ctx);
+
 			/* wake_up job_abort, stop_streaming */
 			spin_lock(&ctx->slock);
 			if (ctx->state & GSC_CTX_STOP_REQ) {
@@ -1024,14 +1258,15 @@ static irqreturn_t gsc_irq_handler(int irq, void *priv)
 			}
 			spin_unlock(&ctx->slock);
 		}
-		/* schedule pm_runtime_put_sync */
-		queue_work(gsc->irq_workqueue, &gsc->work_struct);
+		pm_runtime_put(&gsc->pdev->dev);
+		gsc->runtime_put_cnt++;
 	} else if (test_bit(ST_OUTPUT_STREAMON, &gsc->state)) {
-		if (!list_empty(&gsc->out.active_buf_q)) {
+		if (!list_empty(&gsc->out.active_buf_q) &&
+		    !list_is_singular(&gsc->out.active_buf_q)) {
 			struct gsc_input_buf *done_buf;
 			done_buf = active_queue_pop(&gsc->out, gsc);
-			gsc_hw_set_input_buf_masking(gsc, done_buf->idx, true);
-			if (!list_is_last(&done_buf->list, &gsc->out.active_buf_q)) {
+			if (done_buf->idx != gsc_hw_get_curr_in_buf_idx(gsc)) {
+				gsc_hw_set_input_buf_masking(gsc, done_buf->idx, true);
 				vb2_buffer_done(&done_buf->vb, VB2_BUF_STATE_DONE);
 				list_del(&done_buf->list);
 			}
@@ -1039,64 +1274,179 @@ static irqreturn_t gsc_irq_handler(int irq, void *priv)
 	} else if (test_bit(ST_CAPT_PEND, &gsc->state)) {
 		gsc_cap_irq_handler(gsc);
 	}
+
 isr_unlock:
 	spin_unlock(&gsc->slock);
 	return IRQ_HANDLED;
 }
+
 static int gsc_get_media_info(struct device *dev, void *p)
 {
 	struct exynos_md **mdev = p;
 	struct platform_device *pdev = to_platform_device(dev);
+
 	mdev[pdev->id] = dev_get_drvdata(dev);
 	if (!mdev[pdev->id])
 		return -ENODEV;
+
 	return 0;
 }
-int gsc_bus_request_get(struct gsc_dev *gsc)
+
+void gsc_pm_qos_ctrl(struct gsc_dev *gsc, enum gsc_qos_status status,
+			int mem_val, int int_val)
 {
-	if (!gsc->mif_min_hd) {
-		gsc->mif_min_hd = exynos5_bus_mif_min(667000);
-		if (!gsc->mif_min_hd)
-			gsc_err("failed to request min_freq");
+	int qos_cnt;
+
+	if (status == GSC_QOS_ON) {
+		qos_cnt = atomic_inc_return(&gsc->qos_cnt);
+		gsc_dbg("mif val : %d, int val : %d", mem_val, int_val);
+		if (qos_cnt == 1) {
+			pm_qos_add_request(&gsc->exynos5_gsc_mif_qos,
+					PM_QOS_BUS_THROUGHPUT, mem_val);
+			pm_qos_add_request(&gsc->exynos5_gsc_int_qos,
+					PM_QOS_DEVICE_THROUGHPUT, int_val);
+		} else {
+			pm_qos_update_request(&gsc->exynos5_gsc_mif_qos,
+					mem_val);
+			pm_qos_update_request(&gsc->exynos5_gsc_int_qos,
+					int_val);
+		}
+	} else if (status == GSC_QOS_OFF) {
+		qos_cnt = atomic_dec_return(&gsc->qos_cnt);
+		if (qos_cnt == 0) {
+			pm_qos_remove_request(&gsc->exynos5_gsc_mif_qos);
+			pm_qos_remove_request(&gsc->exynos5_gsc_int_qos);
+		}
 	}
-	if (!gsc->int_min_hd) {
-		gsc->int_min_hd = exynos5_bus_int_min(200000);
-		if (!gsc->int_min_hd)
-			gsc_err("failed to request min_freq");
+}
+
+static void gsc_clk_put(struct gsc_dev *gsc)
+{
+	int i;
+	for (i = 0; i < GSC_MAX_CLOCKS; i++) {
+		if (IS_ERR_OR_NULL(gsc->clock[i]))
+			continue;
+		clk_put(gsc->clock[i]);
+		gsc->clock[i] = NULL;
 	}
+}
+
+void gsc_clock_gating(struct gsc_dev *gsc, enum gsc_clk_status status)
+{
+	int clk_cnt;
+
+	if (status == GSC_CLK_ON) {
+		clk_cnt = atomic_inc_return(&gsc->clk_cnt);
+		if (clk_cnt == 1) {
+			set_bit(ST_PWR_ON, &gsc->state);
+		}
+		clk_enable(gsc->clock[CLK_GATE]);
+	} else if (status == GSC_CLK_OFF) {
+		clk_cnt = atomic_dec_return(&gsc->clk_cnt);
+		if (clk_cnt < 0) {
+			gsc_err("clock count is out of range");
+			atomic_set(&gsc->clk_cnt, 0);
+		} else {
+			clk_disable(gsc->clock[CLK_GATE]);
+			if (clk_cnt == 0)
+				clear_bit(ST_PWR_ON, &gsc->state);
+		}
+	}
+}
+
+int gsc_set_protected_content(struct gsc_dev *gsc, bool enable)
+{
+	unsigned long flags;
+	if (gsc->protected_content == enable)
+		return 0;
+
+	if (enable) {
+		pm_runtime_get_sync(&gsc->pdev->dev);
+		gsc->runtime_get_cnt++;
+	}
+
+	gsc->vb2->set_protected(gsc->alloc_ctx, enable);
+
+	if (!enable) {
+		pm_runtime_put_sync(&gsc->pdev->dev);
+		gsc->runtime_put_cnt++;
+	}
+
+	gsc->protected_content = enable;
+
 	return 0;
 }
-void gsc_bus_request_put(struct gsc_dev *gsc)
+
+void gsc_dump_registers(struct gsc_dev *gsc)
 {
-	if (gsc->mif_min_hd) {
-		exynos5_bus_mif_put(gsc->mif_min_hd);
-		gsc->mif_min_hd = NULL;
-	}
-	if (gsc->int_min_hd) {
-		exynos5_bus_int_put(gsc->int_min_hd);
-		gsc->int_min_hd = NULL;
-	}
+	pr_err("dumping registers\n");
+	print_hex_dump(KERN_ERR, "", DUMP_PREFIX_ADDRESS, 32, 4, gsc->regs,
+			0x0280, false);
+	pr_err("End of GSC_SFR DUMP\n");
+#ifdef CONFIG_SOC_EXYNOS5420
+	pr_err("## Clock SFR of gscaler \n");
+	pr_err("CLKSRC_TOP2 : 0x%x\n", readl(EXYNOS5_CLKSRC_TOP2));
+	pr_err("CLKSRC_TOP5 : 0x%x\n", readl(EXYNOS5_CLKSRC_TOP5));
+	pr_err("CLKSRC_TOP12 : 0x%x\n", readl(EXYNOS5_CLKSRC_TOP12));
+	pr_err("CLKDIV_TOP2 : 0x%x\n", readl(EXYNOS5_CLKDIV_TOP2));
+#endif
+}
+
+int gsc_sysmmu_fault_handler(struct device *dev, const char *mmuname,
+		enum exynos_sysmmu_inttype itype, unsigned long pgtable_base,
+		unsigned long fault_addr)
+{
+	struct platform_device *pdev = to_platform_device(dev);
+	struct gsc_dev *gsc = platform_get_drvdata(pdev);
+
+	pr_err("GSC(%d) PAGE FAULT occurred at 0x%lx (Page table base: 0x%lx)\n",
+			gsc->id, fault_addr, pgtable_base);
+
+	gsc_dump_registers(gsc);
+
+	pr_err("Generating Kernel OOPS... because it is unrecoverable.\n");
+
+	BUG();
+
+	return 0;
 }
 static int gsc_runtime_suspend(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct gsc_dev *gsc = (struct gsc_dev *)platform_get_drvdata(pdev);
+
+	if (!test_bit(ST_RUNTIME_RESUME, &gsc->state))
+		gsc_err("Already clear state");
+
+	clear_bit(ST_RUNTIME_RESUME, &gsc->state);
+	gsc_clock_gating(gsc, GSC_CLK_OFF);
 	if (gsc_m2m_opened(gsc))
 		gsc->m2m.ctx = NULL;
-	gsc->vb2->suspend(gsc->alloc_ctx);
-	clk_disable(gsc->clock);
-	clear_bit(ST_PWR_ON, &gsc->state);
+
 	return 0;
 }
+
 static int gsc_runtime_resume(struct device *dev)
 {
 	struct platform_device *pdev = to_platform_device(dev);
 	struct gsc_dev *gsc = (struct gsc_dev *)platform_get_drvdata(pdev);
-	clk_enable(gsc->clock);
-	gsc->vb2->resume(gsc->alloc_ctx);
-	set_bit(ST_PWR_ON, &gsc->state);
+
+	if (clk_set_parent(gsc->clock[CLK_CHILD],
+			gsc->clock[CLK_PARENT])) {
+		dev_err(dev, "Unable to set parent %s of clock %s.\n",
+			gsc_clocks[CLK_CHILD], gsc_clocks[CLK_PARENT]);
+		return -EINVAL;
+	}
+	if (test_bit(ST_RUNTIME_RESUME, &gsc->state))
+		gsc_err("Already resume state");
+
+	set_bit(ST_RUNTIME_RESUME, &gsc->state);
+
+	gsc_clock_gating(gsc, GSC_CLK_ON);
+
 	return 0;
 }
+
 static void gsc_pm_runtime_enable(struct device *dev)
 {
 #ifdef CONFIG_PM_RUNTIME
@@ -1105,6 +1455,7 @@ static void gsc_pm_runtime_enable(struct device *dev)
 	gsc_runtime_resume(dev);
 #endif
 }
+
 static void gsc_pm_runtime_disable(struct device *dev)
 {
 #ifdef CONFIG_PM_RUNTIME
@@ -1113,6 +1464,7 @@ static void gsc_pm_runtime_disable(struct device *dev)
 	gsc_runtime_suspend(dev);
 #endif
 }
+
 static int gsc_probe(struct platform_device *pdev)
 {
 	struct gsc_dev *gsc;
@@ -1122,30 +1474,37 @@ static int gsc_probe(struct platform_device *pdev)
 	struct exynos_md *mdev[MDEV_MAX_NUM] = {NULL,};
 	int ret = 0;
 	char workqueue_name[WORKQUEUE_NAME_SIZE];
+
 	dev_dbg(&pdev->dev, "%s():\n", __func__);
 	drv_data = (struct gsc_driverdata *)
 		platform_get_device_id(pdev)->driver_data;
+
 	if (pdev->id >= drv_data->num_entities) {
 		dev_err(&pdev->dev, "Invalid platform device id: %d\n",
 			pdev->id);
 		return -EINVAL;
 	}
+
 	gsc = kzalloc(sizeof(struct gsc_dev), GFP_KERNEL);
 	if (!gsc)
 		return -ENOMEM;
+
 	gsc->id = pdev->id;
 	gsc->variant = drv_data->variant[gsc->id];
 	gsc->pdev = pdev;
 	gsc->pdata = pdev->dev.platform_data;
+
 	init_waitqueue_head(&gsc->irq_queue);
 	spin_lock_init(&gsc->slock);
 	mutex_init(&gsc->lock);
+
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!res) {
 		dev_err(&pdev->dev, "failed to find the registers\n");
 		ret = -ENOENT;
 		goto err_info;
 	}
+
 	gsc->regs_res = request_mem_region(res->start, resource_size(res),
 			dev_name(&pdev->dev));
 	if (!gsc->regs_res) {
@@ -1153,19 +1512,14 @@ static int gsc_probe(struct platform_device *pdev)
 		ret = -ENOENT;
 		goto err_info;
 	}
+
 	gsc->regs = ioremap(res->start, resource_size(res));
 	if (!gsc->regs) {
 		dev_err(&pdev->dev, "failed to map registers\n");
 		ret = -ENXIO;
 		goto err_req_region;
 	}
-	/* Get Gscaler clock */
-	gsc->clock = clk_get(&gsc->pdev->dev, GSC_CLOCK_GATE_NAME);
-	if (IS_ERR(gsc->clock)) {
-		gsc_err("failed to get gscaler.%d clock", gsc->id);
-		goto err_regs_unmap;
-	}
-	clk_put(gsc->clock);
+
 	res = platform_get_resource(pdev, IORESOURCE_IRQ, 0);
 	if (!res) {
 		dev_err(&pdev->dev, "failed to get IRQ resource\n");
@@ -1173,60 +1527,106 @@ static int gsc_probe(struct platform_device *pdev)
 		goto err_regs_unmap;
 	}
 	gsc->irq = res->start;
-	ret = request_irq(gsc->irq, gsc_irq_handler, 0, pdev->name, gsc);
-	if (ret) {
-		dev_err(&pdev->dev, "failed to install irq (%d)\n", ret);
+
+	gsc->clock[CLK_GATE] =
+		clk_get(&gsc->pdev->dev, gsc_clocks[CLK_GATE]);
+	if (IS_ERR(gsc->clock[CLK_GATE])) {
+		gsc_err("failed to get gscaler.%d clock", gsc->id);
 		goto err_regs_unmap;
 	}
+
+	/* Get Gscaler clock */
+	gsc->clock[CLK_CHILD] = clk_get(NULL, gsc_clocks[CLK_CHILD]);
+	if (IS_ERR(gsc->clock[CLK_CHILD])) {
+		dev_err(&pdev->dev, "failed to get %s clock\n",
+			gsc_clocks[CLK_CHILD]);
+		goto err_regs_unmap;
+	}
+
+	gsc->clock[CLK_PARENT] = clk_get(NULL, gsc_clocks[CLK_PARENT]);
+	if (IS_ERR(gsc->clock[CLK_PARENT])) {
+		dev_err(&pdev->dev, "failed to get %s clock\n",
+			gsc_clocks[CLK_PARENT]);
+		goto err_regs_unmap;
+	}
+
 #if defined(CONFIG_VIDEOBUF2_CMA_PHYS)
 	gsc->vb2 = &gsc_vb2_cma;
 #elif defined(CONFIG_VIDEOBUF2_ION)
 	gsc->vb2 = &gsc_vb2_ion;
 #endif
+
 	platform_set_drvdata(pdev, gsc);
+
 	ret = gsc_register_m2m_device(gsc);
 	if (ret)
-		goto err_irq;
+		goto err_clk_put;
+
 	/* find media device */
 	driver = driver_find(MDEV_MODULE_NAME, &platform_bus_type);
 	if (!driver)
-		goto err_irq;
+		goto err_clk_put;
+
 	ret = driver_for_each_device(driver, NULL, &mdev[0],
 			gsc_get_media_info);
 	if (ret)
-		goto err_irq;
+		goto err_clk_put;
+
 	gsc->mdev[MDEV_OUTPUT] = mdev[MDEV_OUTPUT];
 	gsc->mdev[MDEV_CAPTURE] = mdev[MDEV_CAPTURE];
+
 	gsc_dbg("mdev->mdev[%d] = 0x%08x, mdev->mdev[%d] = 0x%08x",
 		 MDEV_OUTPUT, (u32)gsc->mdev[MDEV_OUTPUT], MDEV_CAPTURE,
 		 (u32)gsc->mdev[MDEV_CAPTURE]);
+
 	ret = gsc_register_output_device(gsc);
 	if (ret)
-		goto err_irq;
+		goto err_clk_put;
+
 	if (gsc->pdata)	{
 		ret = gsc_register_capture_device(gsc);
 		if (ret)
-			goto err_irq;
+			goto err_clk_put;
 	}
-	sprintf(workqueue_name, "gsc%d_irq_wq_name", gsc->id);
+	snprintf(workqueue_name, WORKQUEUE_NAME_SIZE,
+			"gsc%d_irq_wq_name", gsc->id);
 	gsc->irq_workqueue = create_singlethread_workqueue(workqueue_name);
 	if (gsc->irq_workqueue == NULL) {
 		dev_err(&pdev->dev, "failed to create workqueue for gsc\n");
-		goto err_irq;
+		goto err_clk_put;
 	}
-	INIT_WORK(&gsc->work_struct, gsc_wq_suspend);
+
+	ret = request_irq(gsc->irq, gsc_irq_handler, 0, pdev->name, gsc);
+	if (ret) {
+		dev_err(&pdev->dev, "failed to install irq (%d)\n", ret);
+		goto err_clk_put;
+	}
+
 	gsc->alloc_ctx = gsc->vb2->init(gsc);
 	if (IS_ERR(gsc->alloc_ctx)) {
 		ret = PTR_ERR(gsc->alloc_ctx);
-		goto err_wq;
+		goto err_irq;
 	}
+
+	exynos_sysmmu_set_fault_handler(&pdev->dev,
+			(sysmmu_fault_handler_t)gsc_sysmmu_fault_handler);
+
+	exynos_create_iovmm(&pdev->dev, 3, 3);
+	gsc->vb2->resume(gsc->alloc_ctx);
+
 	gsc_pm_runtime_enable(&pdev->dev);
+
+	gsc->runtime_get_cnt = 0;
+	gsc->runtime_put_cnt = 0;
+	clear_bit(ST_RUNTIME_RESUME, &gsc->state);
 	gsc_info("gsc-%d registered successfully", gsc->id);
+
 	return 0;
-err_wq:
-	destroy_workqueue(gsc->irq_workqueue);
+
 err_irq:
 	free_irq(gsc->irq, gsc);
+err_clk_put:
+	gsc_clk_put(gsc);
 err_regs_unmap:
 	iounmap(gsc->regs);
 err_req_region:
@@ -1234,32 +1634,44 @@ err_req_region:
 	kfree(gsc->regs_res);
 err_info:
 	kfree(gsc);
+
 	return ret;
 }
+
 static int __devexit gsc_remove(struct platform_device *pdev)
 {
 	struct gsc_dev *gsc =
 		(struct gsc_dev *)platform_get_drvdata(pdev);
+
 	free_irq(gsc->irq, gsc);
+
 	gsc_unregister_m2m_device(gsc);
 	gsc_unregister_output_device(gsc);
 	gsc_unregister_capture_device(gsc);
+
 	gsc->vb2->cleanup(gsc->alloc_ctx);
 	gsc_pm_runtime_disable(&pdev->dev);
+	gsc_clk_put(gsc);
+	gsc->vb2->suspend(gsc->alloc_ctx);
+
 	iounmap(gsc->regs);
 	release_resource(gsc->regs_res);
 	kfree(gsc->regs_res);
 	kfree(gsc);
+
 	dev_info(&pdev->dev, "%s driver unloaded\n", pdev->name);
 	return 0;
 }
+
 static int gsc_suspend(struct device *dev)
 {
 	struct platform_device *pdev;
 	struct gsc_dev *gsc;
 	int ret = 0;
+
 	pdev = to_platform_device(dev);
 	gsc = (struct gsc_dev *)platform_get_drvdata(pdev);
+
 	if (gsc_m2m_run(gsc)) {
 		set_bit(ST_STOP_REQ, &gsc->state);
 		ret = wait_event_timeout(gsc->irq_queue,
@@ -1273,27 +1685,26 @@ static int gsc_suspend(struct device *dev)
 		gsc_err("capture device is running!!");
 		return -EINVAL;
 	}
-#ifdef CONFIG_PM_RUNTIME
-	pm_runtime_put_sync(dev);
-#else
-	gsc_runtime_suspend(dev);
+#ifndef CONFIG_PM_RUNTIME
+	gsc_clock_gating(gsc, GSC_CLK_OFF);
 #endif
 	return ret;
 }
+
 static int gsc_resume(struct device *dev)
 {
 	struct platform_device *pdev;
 	struct gsc_driverdata *drv_data;
 	struct gsc_dev *gsc;
 	struct gsc_ctx *ctx;
+
 	pdev = to_platform_device(dev);
 	gsc = (struct gsc_dev *)platform_get_drvdata(pdev);
 	drv_data = (struct gsc_driverdata *)
 		platform_get_device_id(pdev)->driver_data;
-#ifdef CONFIG_PM_RUNTIME
-	pm_runtime_get_sync(dev);
-#else
-	gsc_runtime_resume(dev);
+
+#ifndef CONFIG_PM_RUNTIME
+	gsc_clock_gating(gsc, GSC_CLK_ON);
 #endif
 	if (gsc_m2m_opened(gsc)) {
 		ctx = v4l2_m2m_get_curr_priv(gsc->m2m.m2m_dev);
@@ -1304,12 +1715,14 @@ static int gsc_resume(struct device *dev)
 	}
 	return 0;
 }
+
 static const struct dev_pm_ops gsc_pm_ops = {
 	.suspend		= gsc_suspend,
 	.resume			= gsc_resume,
 	.runtime_suspend	= gsc_runtime_suspend,
 	.runtime_resume		= gsc_runtime_resume,
 };
+
 struct gsc_pix_max gsc_v_max = {
 	.org_scaler_bypass_w	= 8192,
 	.org_scaler_bypass_h	= 8192,
@@ -1317,13 +1730,14 @@ struct gsc_pix_max gsc_v_max = {
 	.org_scaler_input_h	= 3344,
 	.real_rot_dis_w		= 4800,
 	.real_rot_dis_h		= 3344,
-	.real_rot_en_w		= 2047,
-	.real_rot_en_h		= 2047,
+	.real_rot_en_w		= 2048,
+	.real_rot_en_h		= 2048,
 	.target_rot_dis_w	= 4800,
 	.target_rot_dis_h	= 3344,
-	.target_rot_en_w	= 2016,
-	.target_rot_en_h	= 2016,
+	.target_rot_en_w	= 3344,
+	.target_rot_en_h	= 4800,
 };
+
 struct gsc_pix_min gsc_v_min = {
 		.org_w			= 64,
 		.org_h			= 32,
@@ -1334,16 +1748,18 @@ struct gsc_pix_min gsc_v_min = {
 		.target_rot_en_w	= 16,
 		.target_rot_en_h	= 8,
 };
+
 struct gsc_pix_align gsc_v_align = {
 		.org_h			= 16,
 		.org_w			= 16,
-		.offset_h		= 2,
+		.offset_w		= 2,
 		.real_w			= 1,
 		.real_h			= 1,
 		.target_w		= 2,
 		.target_h		= 2,
 };
-struct gsc_variant gsc_v_200_variant = {
+
+struct gsc_variant gsc_variant = {
 	.pix_max		= &gsc_v_max,
 	.pix_min		= &gsc_v_min,
 	.pix_align		= &gsc_v_align,
@@ -1355,23 +1771,26 @@ struct gsc_variant gsc_v_200_variant = {
 	.pre_sc_down_max	= 4,
 	.local_sc_down		= 4,
 };
-static struct gsc_driverdata gsc_v_200_drvdata = {
+
+static struct gsc_driverdata gsc_drvdata = {
 	.variant = {
-		[0] = &gsc_v_200_variant,
-		[1] = &gsc_v_200_variant,
-		[2] = &gsc_v_200_variant,
-		[3] = &gsc_v_200_variant,
+		[0] = &gsc_variant,
+		[1] = &gsc_variant,
+		[2] = &gsc_variant,
+		[3] = &gsc_variant,
 	},
 	.num_entities = 4,
 };
+
 static struct platform_device_id gsc_driver_ids[] = {
 	{
 		.name		= "exynos-gsc",
-		.driver_data	= (unsigned long)&gsc_v_200_drvdata,
+		.driver_data	= (unsigned long)&gsc_drvdata,
 	},
 	{},
 };
 MODULE_DEVICE_TABLE(platform, gsc_driver_ids);
+
 static struct platform_driver gsc_driver = {
 	.probe		= gsc_probe,
 	.remove	= __devexit_p(gsc_remove),
@@ -1382,19 +1801,9 @@ static struct platform_driver gsc_driver = {
 		.pm	= &gsc_pm_ops,
 	}
 };
-static int __init gsc_init(void)
-{
-	int ret = platform_driver_register(&gsc_driver);
-	if (ret)
-		gsc_err("platform_driver_register failed: %d\n", ret);
-	return ret;
-}
-static void __exit gsc_exit(void)
-{
-	platform_driver_unregister(&gsc_driver);
-}
-module_init(gsc_init);
-module_exit(gsc_exit);
+
+module_platform_driver(gsc_driver);
+
 MODULE_AUTHOR("Hyunwong Kim <khw0178.kim@samsung.com>");
 MODULE_DESCRIPTION("Samsung EXYNOS5 Soc series G-Scaler driver");
 MODULE_LICENSE("GPL");
