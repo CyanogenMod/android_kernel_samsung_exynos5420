@@ -334,7 +334,7 @@ int gsc_enum_fmt_mplane(struct v4l2_fmtdesc *f)
 	return 0;
 }
 
-u32 get_plane_size(struct gsc_frame *frame, unsigned int plane)
+static int get_plane_info(struct gsc_frame *frame, u32 addr, u32 *index, u32 *ret_addr)
 {
 	if (!frame || plane >= frame->fmt->num_planes) {
 		gsc_err("Invalid argument");
@@ -348,17 +348,18 @@ u32 get_plane_info(struct gsc_frame frm, u32 addr, u32 *index)
 {
 	if (frm.addr.y == addr) {
 		*index = 0;
-		return frm.addr.y;
+		*ret_addr = frm->addr.y;
 	} else if (frm.addr.cb == addr) {
 		*index = 1;
-		return frm.addr.cb;
+		*ret_addr = frm->addr.cb
 	} else if (frm.addr.cr == addr) {
 		*index = 2;
-		return frm.addr.cr;
+		*ret_addr = frm->addr.cr;
 	} else {
 		gsc_err("Plane address is wrong");
 		return -EINVAL;
 	}
+	return 0;
 }
 
 void gsc_set_prefbuf(struct gsc_dev *gsc, struct gsc_frame frm)
@@ -376,10 +377,11 @@ void gsc_set_prefbuf(struct gsc_dev *gsc, struct gsc_frame frm)
 		u32 t_min, t_max;
 
 		t_min = min3(frm.addr.y, frm.addr.cb, frm.addr.cr);
-		low_addr = get_plane_info(frm, t_min, &low_plane);
+		if (get_plane_info(frm, t_min, &low_plane, &low_addr))
+		        return;
 		t_max = max3(frm.addr.y, frm.addr.cb, frm.addr.cr);
-		high_addr = get_plane_info(frm, t_max, &high_plane);
-
+		if (get_plane_info(frm, t_max, &high_plane, &high_addr))
+                        return;
 		mid_plane = 3 - (low_plane + high_plane);
 		if (mid_plane == 0)
 			mid_addr = frm.addr.y;
