@@ -50,7 +50,7 @@
 #endif
 #define CHECK_PR_NUMBER
 #define REPORT_2D_W
-#define USE_STYLUS
+/* #define USE_STYLUS */
 /* #define SKIP_UPDATE_FW_ON_PROBE */
 /* #define REPORT_2D_Z */
 #define USE_ACTIVE_REPORT_RATE
