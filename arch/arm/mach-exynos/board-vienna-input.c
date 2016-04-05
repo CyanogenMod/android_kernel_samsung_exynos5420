@@ -777,6 +777,7 @@ static struct platform_device gpio_keys = {
 	},
 };
 
+#ifdef CONFIG_SEC_DEBUG
 static struct input_debug_key_state kstate[] = {
 	SET_DEBUG_KEY(KEY_POWER, false),
 	SET_DEBUG_KEY(KEY_VOLUMEUP, false),
@@ -795,6 +796,7 @@ static struct platform_device input_debug = {
 		.platform_data = &input_debug_platform_data,
 	},
 };
+#endif
 
 #ifdef CONFIG_INPUT_BOOSTER
 static enum booster_device_type get_booster_device(int code)
@@ -891,7 +893,9 @@ static struct platform_device input_booster = {
 static struct platform_device *input_devices[] __initdata = {
 	&s3c_device_i2c0,
 	&gpio_keys,
+#ifdef CONFIG_SEC_DEBUG
 	&input_debug,
+#endif
 #ifdef CONFIG_INPUT_WACOM
 	&exynos5_device_hs_i2c4,
 #endif
